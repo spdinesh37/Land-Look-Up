@@ -1,49 +1,78 @@
+# extract_data.py
 import requests
 import pandas as pd
-import os
+from sqlalchemy import create_engine, text
 
+# MySQL connection
+username = 'root'
+password = 'mysql1'
+host = 'localhost'
+port = 3306
+database = 'land_lookup'
+
+# WCAD API
 BASE_URL = "https://data.wcad.org/api/v3/views/an3x-cnmw/query.json"
 APP_TOKEN = "o9NY7r7FdFUFpFQQC9vAgy7Jx"
-CSV_FILE = r"E:\UAB\Land-Look-Up\land_lookup\data\land_records_sample.csv"
+BATCH_SIZE = 5000  # fetch 5000 rows for now
 
-def fetch_data_incrementally(batch_size=5000):
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "X-App-Token": APP_TOKEN
-    }
+try:
+    engine = create_engine(f'mysql+pymysql://{username}:{password}@{host}:{port}/{database}')
+    connection = engine.connect()
+    print("✅ Connected to MySQL database!")
 
-    offset = 0
-    first_batch = True
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "X-App-Token": APP_TOKEN}
+    params = {"$limit": BATCH_SIZE, "$offset": 0}
 
-    while True:
-        params = {
-            "$limit": batch_size,
-            "$offset": offset,
-            "$select": "propertyid,quickrefid,description,area,class,actyrbuilt,effyrbuilt,bedrooms,fireplace"
-        }
+    print("Fetching data from WCAD API...")
+    response = requests.get(BASE_URL, headers=headers, params=params)
+    response.raise_for_status()
+    data = response.json()
+    print(f"Fetched {len(data)} rows.")
 
-        response = requests.get(BASE_URL, headers=headers, params=params)
-        response.raise_for_status()
-        data = response.json()
+    if not data:
+        print("No data returned from API.")
+    else:
+        # Only extract required fields from JSON to avoid duplicates
+        cleaned_data = []
+        for row in data:
+            cleaned_row = {
+                "propertyid": row.get(":id"),            # use API row ID as primary key
+                "quickrefid": row.get("parcelid"),       # example mapping
+                "description": row.get("usedscrp"),
+                "area": row.get("assessedacres"),
+                "class": row.get("usecd"),
+                "actyrbuilt": row.get("resyrblt"),
+                "effyrbuilt": None,
+                "bedrooms": None,
+                "fireplace": None
+            }
+            # Skip rows without propertyid
+            if cleaned_row["propertyid"] is not None:
+                cleaned_data.append(cleaned_row)
 
-        if not data:
-            print("✅ All data fetched.")
-            break
+        print(f"Rows after cleaning: {len(cleaned_data)}")
 
-        df = pd.DataFrame(data)
-        # If first batch, write header; otherwise append without header
-        if first_batch:
-            df.to_csv(CSV_FILE, index=False, mode='w')
-            first_batch = False
-        else:
-            df.to_csv(CSV_FILE, index=False, mode='a', header=False)
+        # Insert into MySQL
+        with engine.begin() as conn:
+            for row in cleaned_data:
+                # Convert NaN or empty strings to None
+                for k, v in row.items():
+                    if pd.isna(v) or v == "":
+                        row[k] = None
+                try:
+                    conn.execute(
+                        text("""INSERT IGNORE INTO parcels
+                                (propertyid, quickrefid, description, area, class, actyrbuilt, effyrbuilt, bedrooms, fireplace)
+                                VALUES (:propertyid, :quickrefid, :description, :area, :class, :actyrbuilt, :effyrbuilt, :bedrooms, :fireplace)"""),
+                        row
+                    )
+                except Exception as e:
+                    print("Error inserting row:", e)
 
-        print(f"Fetched {len(data)} rows (offset={offset})")
-        offset += batch_size
+        print("✅ Data inserted into parcels table!")
 
-    print(f"✅ Data saved to {CSV_FILE}")
+    connection.close()
+    print("Connection closed.")
 
-if __name__ == "__main__":
-    os.makedirs(os.path.dirname(CSV_FILE), exist_ok=True)
-    fetch_data_incrementally(batch_size=5000)
+except Exception as e:
+    print("Error:", e)
